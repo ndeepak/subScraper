@@ -500,7 +500,7 @@ class TestWorkflowDiagram:
     def test_phases_cover_every_pipeline_step(self):
         diagram_steps = {"amass", "subfinder", "assetfinder", "findomain", "sublist3r",
                          "crtsh", "github-subdomains", "dnsx", "httpx", "screenshots",
-                         "nuclei", "jsscan", "nikto"}
+                         "nuclei", "jsscan", "takeover", "cors", "nikto"}
         assert set(main.PIPELINE_STEPS) == diagram_steps
 
     def test_manual_only_tools_are_not_shown_as_phases(self):

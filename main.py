@@ -350,11 +350,13 @@ STATE_CACHE: Dict[str, Any] = {
 
 JOB_QUEUE: deque = deque()
 MAX_RUNNING_JOBS = 1
+MAX_QUEUED_JOBS = 500  # Backlog ceiling; keeps queued-job memory bounded
 RUNNING_JOBS: Dict[str, Dict[str, Any]] = {}
 COMPLETED_JOBS: Dict[str, Dict[str, Any]] = {}  # Store completed job reports
 MAX_COMPLETED_JOBS_PER_DOMAIN = 10  # Keep last N completed jobs per domain
+MAX_COMPLETED_JOB_LOG_LINES = 50  # Log tail kept per finished job (full log is in the history table)
 JOB_LOCK = threading.Lock()
-PIPELINE_STEPS = ["amass", "subfinder", "assetfinder", "findomain", "sublist3r", "crtsh", "github-subdomains", "dnsx", "httpx", "screenshots", "nuclei", "jsscan", "nikto"]
+PIPELINE_STEPS = ["amass", "subfinder", "assetfinder", "findomain", "sublist3r", "crtsh", "github-subdomains", "dnsx", "httpx", "screenshots", "nuclei", "jsscan", "takeover", "cors", "nikto"]
 
 # Global rate limiter
 RATE_LIMIT_LOCK = threading.Lock()
@@ -1816,6 +1818,8 @@ def default_config() -> Dict[str, Any]:
         "enable_waybackurls": True,
         "enable_gau": True,
         "enable_js_scan": True,
+        "enable_takeover_scan": True,
+        "enable_cors_scan": True,
         "use_bundled_nuclei_templates": True,
         "js_scan_max_files": 300,
         "js_scan_max_html_hosts": 60,
@@ -3446,6 +3450,7 @@ def update_config_settings(values: Dict[str, Any]) -> Tuple[bool, str, Dict[str,
             changed = True
 
     for key in ["enable_subfinder", "enable_assetfinder", "enable_findomain", "enable_sublist3r", "enable_screenshots", "enable_crtsh", "enable_github_subdomains", "enable_dnsx", "enable_waybackurls", "enable_gau", "enable_js_scan",
+                "enable_takeover_scan", "enable_cors_scan",
                 "use_bundled_nuclei_templates"]:
         if key in values:
             new_value = bool_from_value(values.get(key), cfg.get(key, True))
@@ -3711,32 +3716,68 @@ def release_lock() -> None:
         pass
 
 
-def load_state() -> Dict[str, Any]:
+def load_target_extras() -> Dict[str, Dict[str, Any]]:
     """
-    Load state (targets and subdomains) from SQLite database.
-    
-    Optimizations:
-    - Uses single JOIN query instead of N+1 queries for better performance
-    - Processes results in a single pass
+    Per-target payload (js_scan, takeover, cors, endpoints...) without the
+    subdomain join.
+
+    The cross-target overviews only read target-level keys, so going through
+    load_state() made them materialise every subdomain in the database — tens of
+    thousands of dicts — to reach a handful of summary blobs.
     """
     db = get_db()
     cursor = db.cursor()
-    
+    cursor.execute("SELECT domain, data FROM targets")
+    extras: Dict[str, Dict[str, Any]] = {}
+    for domain, data_text in cursor:
+        try:
+            parsed = json.loads(data_text) if data_text else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        extras[domain] = parsed if isinstance(parsed, dict) else {}
+    return extras
+
+
+def _subdomain_digest(data_text: Optional[str], interesting: Any,
+                      comments_text: Optional[str]) -> str:
+    """Cheap fingerprint of a persisted subdomain row, used to skip no-op writes."""
+    payload = f"{data_text or ''}\x00{'' if interesting is None else int(bool(interesting))}\x00{comments_text or ''}"
+    return hashlib.md5(payload.encode("utf-8", "replace")).hexdigest()
+
+
+def load_state(domain: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load state (targets and subdomains) from SQLite database.
+
+    Pass `domain` to load just that target. A pipeline only ever touches its own
+    target, and loading every target instead means rebuilding tens of thousands
+    of subdomain dicts (~100MB, ~1s) on each of the dozens of load/save cycles a
+    run performs. The scoped state round-trips through save_state() unchanged:
+    save_state() writes whatever targets the state contains, and the subdomain
+    reconciliation it does is already per-domain.
+    """
+    db = get_db()
+    cursor = db.cursor()
+
     # OPTIMIZATION: Single query with JOIN instead of N+1 queries
-    cursor.execute("""
+    base_sql = """
         SELECT
             t.domain, t.flags, t.options, t.comments, t.data,
             s.subdomain, s.data, s.interesting, s.comments as sub_comments
         FROM targets t
         LEFT JOIN subdomains s ON t.domain = s.domain
-        ORDER BY t.domain, s.subdomain
-    """)
+    """
+    if domain:
+        cursor.execute(base_sql + " WHERE t.domain = ? ORDER BY s.subdomain", (domain,))
+    else:
+        cursor.execute(base_sql + " ORDER BY t.domain, s.subdomain")
     
     targets = {}
     current_domain = None
     current_target = None
     subdomains = {}
-    
+    digests: Dict[str, str] = {}
+
     # Process results in a single pass
     for row in cursor:
         domain = row[0]
@@ -3782,6 +3823,7 @@ def load_state() -> Dict[str, Any]:
                 if row[8]:
                     sub_data["comments"] = json.loads(row[8])
                 subdomains[subdomain] = sub_data
+                digests[f"{domain}\x00{subdomain}"] = _subdomain_digest(row[6], row[7], row[8])
             except json.JSONDecodeError:
                 subdomains[subdomain] = {}
     
@@ -3794,12 +3836,64 @@ def load_state() -> Dict[str, Any]:
     cursor.execute("SELECT MAX(updated_at) FROM targets")
     last_updated_row = cursor.fetchone()
     last_updated = last_updated_row[0] if last_updated_row and last_updated_row[0] else None
-    
-    return {
+
+    state: Dict[str, Any] = {
         "version": 1,
         "targets": targets,
-        "last_updated": last_updated
+        "last_updated": last_updated,
     }
+    # Lets save_state() skip re-writing subdomain rows that nothing touched.
+    state["_digests"] = digests
+    if domain:
+        # Marks the state as covering one target only, so save_state() knows the
+        # absent targets are out of scope rather than deleted.
+        state["_scope"] = domain
+    return state
+
+
+# The static dashboard.html is a whole-database render. save_state() runs dozens
+# of times per pipeline, so rendering it inline made every save pay for every
+# target in the database. Coalesce instead: mark it dirty and let one background
+# thread redraw at most once per interval.
+DASHBOARD_REFRESH_LOCK = threading.Lock()
+DASHBOARD_REFRESH_MIN_INTERVAL = 15.0
+_DASHBOARD_DIRTY = False
+_DASHBOARD_LAST_RENDER = 0.0
+_DASHBOARD_THREAD: Optional[threading.Thread] = None
+
+
+def _dashboard_refresh_loop() -> None:
+    global _DASHBOARD_DIRTY, _DASHBOARD_LAST_RENDER
+    while True:
+        time.sleep(1.0)
+        with DASHBOARD_REFRESH_LOCK:
+            due = (_DASHBOARD_DIRTY and
+                   time.time() - _DASHBOARD_LAST_RENDER >= DASHBOARD_REFRESH_MIN_INTERVAL)
+            if due:
+                _DASHBOARD_DIRTY = False
+                _DASHBOARD_LAST_RENDER = time.time()
+        if not due:
+            continue
+        try:
+            generate_html_dashboard()
+        except Exception as exc:
+            log(f"Error refreshing dashboard HTML: {exc}")
+
+
+def request_dashboard_refresh() -> None:
+    """Mark dashboard.html stale; a background thread redraws it, throttled."""
+    global _DASHBOARD_DIRTY, _DASHBOARD_THREAD
+    with DASHBOARD_REFRESH_LOCK:
+        _DASHBOARD_DIRTY = True
+        if _DASHBOARD_THREAD is None or not _DASHBOARD_THREAD.is_alive():
+            _DASHBOARD_THREAD = threading.Thread(
+                target=_dashboard_refresh_loop, name="dashboard-refresh", daemon=True)
+            _DASHBOARD_THREAD.start()
+
+
+def public_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop load_state()'s internal bookkeeping keys before a state is exported."""
+    return {key: value for key, value in state.items() if not key.startswith("_")}
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -3813,7 +3907,10 @@ def save_state(state: Dict[str, Any]) -> None:
         cursor = db.cursor()
         
         targets = state.get("targets", {})
-        
+        # Populated by load_state(); absent for hand-built states, in which case
+        # every row is written as before.
+        digests = state.get("_digests") or {}
+
         for domain, target_data in targets.items():
             subdomains = target_data.get("subdomains", {})
             flags = target_data.get("flags", {})
@@ -3852,27 +3949,46 @@ def save_state(state: Dict[str, Any]) -> None:
                     (domain, old_subdomain)
                 )
             
-            # Insert or update subdomains
+            # Insert or update subdomains.
+            # A run re-saves the whole target after each batch, but a batch only
+            # touches a handful of hosts. Comparing against the digest captured
+            # at load time turns "rewrite every row" into "write what changed",
+            # which matters on targets with tens of thousands of subdomains.
+            rows_to_write = []
             for subdomain, sub_data in subdomains.items():
                 # Extract interesting and comments from sub_data
                 interesting = sub_data.get("interesting")
                 interesting_val = None if interesting is None else (1 if interesting else 0)
                 comments_data = sub_data.get("comments", [])
-                
+
                 # Create clean sub_data without interesting/comments for data field
                 clean_sub_data = {k: v for k, v in sub_data.items() if k not in ("interesting", "comments")}
-                
-                cursor.execute(
-                    """INSERT INTO subdomains (domain, subdomain, data, interesting, comments, created_at, updated_at) 
+                data_text = json.dumps(clean_sub_data)
+                comments_text = json.dumps(comments_data)
+
+                if digests:
+                    key = f"{domain}\x00{subdomain}"
+                    new_digest = _subdomain_digest(data_text, interesting_val, comments_text)
+                    if digests.get(key) == new_digest:
+                        continue
+                    digests[key] = new_digest
+
+                rows_to_write.append(
+                    (domain, subdomain, data_text, interesting_val, comments_text, now, now)
+                )
+
+            if rows_to_write:
+                cursor.executemany(
+                    """INSERT INTO subdomains (domain, subdomain, data, interesting, comments, created_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(domain, subdomain) DO UPDATE SET 
+                       ON CONFLICT(domain, subdomain) DO UPDATE SET
                        data = excluded.data,
                        interesting = excluded.interesting,
                        comments = excluded.comments,
                        updated_at = excluded.updated_at""",
-                    (domain, subdomain, json.dumps(clean_sub_data), interesting_val, json.dumps(comments_data), now, now)
+                    rows_to_write,
                 )
-        
+
         db.commit()
         
         # Invalidate state cache after successful save
@@ -3880,10 +3996,7 @@ def save_state(state: Dict[str, Any]) -> None:
     finally:
         release_lock()
     
-    try:
-        generate_html_dashboard(state)
-    except Exception as e:
-        log(f"Error refreshing dashboard HTML: {e}")
+    request_dashboard_refresh()
 
 
 
@@ -3906,30 +4019,58 @@ def load_completed_jobs() -> Dict[str, Dict[str, Any]]:
     return jobs
 
 
-def save_completed_jobs() -> None:
-    """Save completed jobs to SQLite database."""
+def save_completed_jobs(job_keys: Optional[List[str]] = None) -> None:
+    """
+    Persist completed jobs.
+
+    Pass `job_keys` to write just those. Completed job records carry their whole
+    step tree and log tail, so deep-copying and re-inserting every one of them
+    on each completion made the cost grow with history rather than with the work
+    actually done.
+    """
     with JOB_LOCK:
-        jobs_to_save = copy.deepcopy(COMPLETED_JOBS)
-    
+        if job_keys is None:
+            selected = list(COMPLETED_JOBS.items())
+        else:
+            selected = [(key, COMPLETED_JOBS[key]) for key in job_keys if key in COMPLETED_JOBS]
+        jobs_to_save = copy.deepcopy(selected)
+
     try:
         db = get_db()
         cursor = db.cursor()
         now = datetime.now(timezone.utc).isoformat()
-        
-        for job_key, job_data in jobs_to_save.items():
+
+        rows = []
+        for job_key, job_data in jobs_to_save:
             domain = job_key.rsplit("_", 1)[0] if "_" in job_key else job_key
             completed_at = job_data.get("completed_at", now)
-            
-            cursor.execute(
-                """INSERT OR REPLACE INTO completed_jobs 
-                   (job_key, domain, data, completed_at, created_at) 
+            rows.append((job_key, domain, json.dumps(job_data), completed_at, now))
+
+        if rows:
+            cursor.executemany(
+                """INSERT OR REPLACE INTO completed_jobs
+                   (job_key, domain, data, completed_at, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (job_key, domain, json.dumps(job_data), completed_at, now)
+                rows,
             )
-        
         db.commit()
     except Exception as e:
         log(f"Error saving completed jobs: {e}")
+
+
+def _delete_completed_jobs(job_keys: List[str]) -> None:
+    """Drop completed-job rows that in-memory pruning has already discarded."""
+    if not job_keys:
+        return
+    try:
+        db = get_db()
+        db.cursor().executemany(
+            "DELETE FROM completed_jobs WHERE job_key = ?",
+            [(key,) for key in job_keys],
+        )
+        db.commit()
+    except Exception as exc:
+        log(f"Error pruning completed jobs: {exc}")
 
 
 def add_completed_job(domain: str, job_data: Dict[str, Any]) -> None:
@@ -3937,12 +4078,20 @@ def add_completed_job(domain: str, job_data: Dict[str, Any]) -> None:
     Add a completed job to the completed jobs storage.
     Keeps only the last MAX_COMPLETED_JOBS_PER_DOMAIN jobs per domain.
     """
+    pruned_keys: List[str] = []
     with JOB_LOCK:
         # Remove thread reference before deepcopy as it's not serializable
         # Thread objects contain locks that cannot be pickled
         job_data_copy = {k: v for k, v in job_data.items() if k != 'thread'}
         job_copy = copy.deepcopy(job_data_copy)
-        
+
+        # Every log line is already in the history table, so the copy kept on the
+        # completed record only needs to be enough for an at-a-glance view. Kept
+        # in full it pinned ~100KB per finished job in memory for the process's
+        # whole life, and shipped it to the browser on every dashboard poll.
+        if isinstance(job_copy.get("logs"), list):
+            job_copy["logs"] = job_copy["logs"][-MAX_COMPLETED_JOB_LOG_LINES:]
+
         # Add completion timestamp
         completion_time = datetime.now(timezone.utc)
         job_copy["completed_at"] = completion_time.isoformat()
@@ -3959,9 +4108,12 @@ def add_completed_job(domain: str, job_data: Dict[str, Any]) -> None:
             domain_jobs.sort(key=lambda x: x[1].get("completed_at", ""), reverse=True)
             for old_key, _ in domain_jobs[MAX_COMPLETED_JOBS_PER_DOMAIN:]:
                 COMPLETED_JOBS.pop(old_key, None)
-    
+                pruned_keys.append(old_key)
+
     # Save to disk
-    save_completed_jobs()
+    save_completed_jobs([job_key])
+    if pruned_keys:
+        _delete_completed_jobs(pruned_keys)
 
 
 # Resolving a tool means stat()ing candidate paths and, for httpx and nuclei,
@@ -5797,7 +5949,7 @@ def harvest_enumerator_outputs(
     def ensure_state():
         nonlocal state
         if state is None:
-            state = load_state()
+            state = load_state(domain)
         return state
 
     def process(name: str, enabled: bool, path: Path, parser):
@@ -6037,7 +6189,7 @@ def run_js_scan(domain: str, config: Dict[str, Any],
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    state = load_state()
+    state = load_state(domain)
     js_urls = _gather_js_urls(domain, state, config)
     max_files = int(config.get("js_scan_max_files", 300) or 300)
     truncated = len(js_urls) > max_files
@@ -6113,7 +6265,7 @@ def run_js_scan(domain: str, config: Dict[str, Any],
     }
 
     # Persist.
-    state = load_state()
+    state = load_state(domain)
     tgt = ensure_target_state(state, domain)
     tgt["js_scan"] = js_scan
     # Merge discovered endpoints into the target endpoints list too.
@@ -6178,13 +6330,12 @@ def js_findings_overview(limit_targets: int = 10, limit_secrets: int = 10) -> Di
     Cross-target rollup of JS scan results for the dashboard overview, so JS
     secrets are visible without opening each domain.
     """
-    state = load_state()
     per_target: List[Dict[str, Any]] = []
     recent_secrets: List[Dict[str, Any]] = []
     totals = {"secrets": 0, "endpoints": 0, "params": 0, "files": 0, "targets_scanned": 0}
     secret_types: Dict[str, int] = {}
 
-    for domain, target in (state.get("targets", {}) or {}).items():
+    for domain, target in load_target_extras().items():
         if not isinstance(target, dict):
             continue
         summary = summarize_js_scan(target.get("js_scan"))
@@ -6222,6 +6373,480 @@ def js_findings_overview(limit_targets: int = 10, limit_secrets: int = 10) -> Di
     }
 
 
+# ============ SUBDOMAIN TAKEOVER DETECTION ============
+#
+# A dangling CNAME — a record still pointing at a deprovisioned third-party
+# service — lets anyone who can claim that service name serve content on the
+# target's hostname. Detection is a two-part test, and BOTH parts must hold:
+#
+#   1. the CNAME resolves into a known service's domain, and
+#   2. the service answers with its specific "no such account" fingerprint.
+#
+# Requiring the fingerprint is what keeps this out of the false-positive pile:
+# a CNAME to a *live* Shopify store also points at shopify.com, and reporting
+# that as a takeover is exactly the kind of unverified scanner output that gets
+# reports closed as N/A.
+
+TAKEOVER_SIGNATURES: List[Dict[str, Any]] = [
+    {"service": "AWS/S3", "cnames": ["s3.amazonaws.com", "s3-website"],
+     "fingerprints": ["NoSuchBucket", "The specified bucket does not exist"]},
+    {"service": "GitHub Pages", "cnames": ["github.io", "githubusercontent.com"],
+     "fingerprints": ["There isn't a GitHub Pages site here",
+                      "For root URLs (like http://example.com/) you must provide an index.html file"]},
+    {"service": "Heroku", "cnames": ["herokuapp.com", "herokudns.com", "herokussl.com"],
+     "fingerprints": ["No such app", "herokucdn.com/error-pages/no-such-app.html"]},
+    {"service": "Shopify", "cnames": ["myshopify.com"],
+     "fingerprints": ["Sorry, this shop is currently unavailable",
+                      "Only one step left!"]},
+    {"service": "Fastly", "cnames": ["fastly.net"],
+     "fingerprints": ["Fastly error: unknown domain"]},
+    {"service": "Pantheon", "cnames": ["pantheonsite.io"],
+     "fingerprints": ["The gods are wise", "404 error unknown site"]},
+    {"service": "Tumblr", "cnames": ["domains.tumblr.com"],
+     "fingerprints": ["Whatever you were looking for doesn't currently exist at this address"]},
+    {"service": "Wordpress", "cnames": ["wordpress.com"],
+     "fingerprints": ["Do you want to register"]},
+    {"service": "Ghost", "cnames": ["ghost.io"],
+     "fingerprints": ["The thing you were looking for is no longer here"]},
+    {"service": "Surge.sh", "cnames": ["surge.sh"],
+     "fingerprints": ["project not found"]},
+    {"service": "Bitbucket", "cnames": ["bitbucket.io"],
+     "fingerprints": ["Repository not found"]},
+    {"service": "Netlify", "cnames": ["netlify.app", "netlify.com"],
+     "fingerprints": ["Not Found - Request ID"]},
+    {"service": "Zendesk", "cnames": ["zendesk.com"],
+     "fingerprints": ["Help Center Closed"]},
+    {"service": "Readme.io", "cnames": ["readme.io"],
+     "fingerprints": ["Project doesnt exist... yet!"]},
+    {"service": "Webflow", "cnames": ["proxy-ssl.webflow.com", "webflow.io"],
+     "fingerprints": ["The page you are looking for doesn't exist or has been moved"]},
+    {"service": "Azure", "cnames": ["azurewebsites.net", "cloudapp.azure.com",
+                                    "trafficmanager.net", "blob.core.windows.net"],
+     "fingerprints": ["404 Web Site not found", "The specified container does not exist"]},
+    {"service": "Cargo Collective", "cnames": ["cargocollective.com"],
+     "fingerprints": ["404 Not Found"]},
+    {"service": "Desk.com", "cnames": ["desk.com"],
+     "fingerprints": ["Sorry, We Couldn't Find That Page"]},
+    {"service": "Help Scout", "cnames": ["helpscoutdocs.com"],
+     "fingerprints": ["No settings were found for this company"]},
+    {"service": "Statuspage", "cnames": ["statuspage.io"],
+     "fingerprints": ["You are being <a href=\"https://www.statuspage.io\">redirected"]},
+]
+
+
+def match_takeover_service(cnames: List[str]) -> Optional[Dict[str, Any]]:
+    """Return the signature whose CNAME suffix matches, or None."""
+    for cname in cnames:
+        for sig in TAKEOVER_SIGNATURES:
+            for needle in sig["cnames"]:
+                if needle in cname:
+                    return sig
+    return None
+
+
+def _takeover_probe(host: str, timeout: int = 12) -> Optional[str]:
+    """Fetch a host over https then http, returning the body text (bounded)."""
+    for scheme in ("https", "http"):
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = Request(f"{scheme}://{host}/", headers={
+                "User-Agent": "Mozilla/5.0 (compatible; subScraper-takeover/1.0)",
+                "Accept": "*/*",
+            })
+            with urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.read(200_000).decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            # A 404 body is exactly what most takeover fingerprints live in.
+            try:
+                return exc.read(200_000).decode("utf-8", errors="replace")
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return None
+
+
+def check_subdomain_takeover(host: str, cnames: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Test one host for a dangling third-party CNAME.
+
+    Returns a finding only when the service fingerprint is actually present in
+    the response body, so live services on the same provider are not reported.
+    """
+    if not cnames:
+        return None
+    sig = match_takeover_service(cnames)
+    if not sig:
+        return None
+
+    body = _takeover_probe(host)
+    if body is None:
+        # Nothing answered. Suspicious with a third-party CNAME, but unproven —
+        # surface it as a lead to verify by hand, never as a confirmed finding.
+        return {
+            "host": host,
+            "service": sig["service"],
+            "cname": cnames,
+            "confirmed": False,
+            "severity": "INFO",
+            "evidence": "CNAME points at a third-party service but the host did not respond.",
+        }
+
+    for fingerprint in sig["fingerprints"]:
+        if fingerprint.lower() in body.lower():
+            return {
+                "host": host,
+                "service": sig["service"],
+                "cname": cnames,
+                "confirmed": True,
+                "severity": "HIGH",
+                "evidence": f"Response contains {sig['service']} unclaimed-resource fingerprint: {fingerprint!r}",
+            }
+    return None
+
+
+def run_takeover_scan(domain: str, config: Dict[str, Any],
+                      job_domain: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Check every known-CNAME host of a target for a dangling delegation.
+
+    Results are stored on the target as `takeover` and mirrored onto each
+    affected subdomain so they show up on the subdomain detail page.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    state = load_state(domain)
+    tgt = ensure_target_state(state, domain)
+    submap = tgt.get("subdomains", {})
+
+    candidates: List[Tuple[str, List[str]]] = []
+    for host, entry in submap.items():
+        httpx_data = (entry or {}).get("httpx") or {}
+        cnames = httpx_data.get("cname") or []
+        if cnames and match_takeover_service(cnames):
+            candidates.append((host, cnames))
+
+    if job_domain:
+        job_log_append(
+            job_domain,
+            f"Takeover scan: {len(candidates)} host(s) with a third-party CNAME to verify.",
+            "takeover",
+        )
+
+    findings: List[Dict[str, Any]] = []
+    workers = max(1, min(10, int(config.get("takeover_scan_workers", 8) or 8)))
+    if candidates:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(check_subdomain_takeover, host, cnames): host
+                       for host, cnames in candidates}
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                except Exception:
+                    continue
+                if result:
+                    findings.append(result)
+
+    findings.sort(key=lambda f: (not f.get("confirmed"), f.get("host", "")))
+    confirmed = sum(1 for f in findings if f.get("confirmed"))
+
+    takeover = {
+        "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "candidates": len(candidates),
+        "findings": findings,
+        "summary": {
+            "candidates": len(candidates),
+            "findings": len(findings),
+            "confirmed": confirmed,
+            "unconfirmed": len(findings) - confirmed,
+        },
+    }
+
+    # Persist: on the target, and on each affected subdomain.
+    state = load_state(domain)
+    tgt = ensure_target_state(state, domain)
+    tgt["takeover"] = takeover
+    submap = tgt.get("subdomains", {})
+    by_host = {f["host"]: f for f in findings}
+    for host, entry in submap.items():
+        if not isinstance(entry, dict):
+            continue
+        finding = by_host.get(host)
+        if finding:
+            entry["takeover"] = finding
+        elif "takeover" in entry:
+            # Previously flagged, now clean: drop the stale finding.
+            entry.pop("takeover", None)
+    save_state(state)
+
+    if job_domain:
+        job_log_append(
+            job_domain,
+            f"Takeover scan done: {confirmed} confirmed, "
+            f"{len(findings) - confirmed} unconfirmed lead(s) from {len(candidates)} candidate(s).",
+            "takeover",
+        )
+    return takeover
+
+
+def summarize_takeover(takeover: Optional[Dict[str, Any]], max_findings: int = 5) -> Optional[Dict[str, Any]]:
+    """Counts plus a few sample hits; full detail stays on the domain page."""
+    if not isinstance(takeover, dict):
+        return None
+    findings = takeover.get("findings") or []
+    summary = takeover.get("summary") or {}
+    return {
+        "scanned_at": takeover.get("scanned_at"),
+        "summary": {
+            "candidates": int(summary.get("candidates", 0) or 0),
+            "findings": int(summary.get("findings", len(findings)) or 0),
+            "confirmed": int(summary.get("confirmed", 0) or 0),
+            "unconfirmed": int(summary.get("unconfirmed", 0) or 0),
+        },
+        "top_findings": [
+            {"host": f.get("host"), "service": f.get("service"),
+             "confirmed": bool(f.get("confirmed")), "severity": f.get("severity")}
+            for f in findings[:max_findings] if isinstance(f, dict)
+        ],
+    }
+
+
+def takeover_findings_overview(limit: int = 25) -> Dict[str, Any]:
+    """Cross-target rollup of takeover findings for the dashboard overview."""
+    rows: List[Dict[str, Any]] = []
+    totals = {"candidates": 0, "confirmed": 0, "unconfirmed": 0, "targets_scanned": 0}
+
+    for domain, target in load_target_extras().items():
+        if not isinstance(target, dict):
+            continue
+        takeover = target.get("takeover")
+        if not isinstance(takeover, dict):
+            continue
+        summary = takeover.get("summary") or {}
+        totals["targets_scanned"] += 1
+        totals["candidates"] += int(summary.get("candidates", 0) or 0)
+        totals["confirmed"] += int(summary.get("confirmed", 0) or 0)
+        totals["unconfirmed"] += int(summary.get("unconfirmed", 0) or 0)
+        for finding in takeover.get("findings", []) or []:
+            if isinstance(finding, dict):
+                rows.append({"domain": domain, **finding})
+
+    rows.sort(key=lambda r: (not r.get("confirmed"), r.get("domain", ""), r.get("host", "")))
+    return {"totals": totals, "findings": rows[:limit]}
+
+
+# ============ CORS MISCONFIGURATION DETECTION ============
+#
+# A cross-origin read is only exploitable when the server both reflects an
+# attacker-controlled Origin AND sets Access-Control-Allow-Credentials: true.
+# Either alone is not a finding: `ACAO: *` cannot carry credentials (browsers
+# refuse the combination), and a reflected origin without credentials only
+# grants what an unauthenticated fetch would already return.
+#
+# The probe sends several origins because servers fail in different ways, and
+# the interesting failures are the sloppy allowlist checks:
+#   evil.com                -> blanket reflection
+#   target.com.evil.com     -> suffix check anchored wrong ("endswith" style)
+#   evildomain.com          -> prefix/substring check
+#   null                    -> sandboxed-iframe origin, often allowlisted
+CORS_PROBE_TIMEOUT = 10
+
+
+def _cors_origin_variants(host: str) -> List[Tuple[str, str]]:
+    """(label, origin) pairs describing the allowlist bug each one would prove."""
+    return [
+        ("arbitrary origin reflected", "https://brutsec-cors-probe.example.com"),
+        ("origin suffix not anchored", f"https://{host}.brutsec-cors-probe.example.com"),
+        ("origin prefix not anchored", f"https://brutsec{host}"),
+        ("null origin allowed", "null"),
+    ]
+
+
+def _cors_probe(url: str, origin: str, timeout: int = CORS_PROBE_TIMEOUT) -> Optional[Dict[str, str]]:
+    """Send one Origin and return the CORS response headers, or None."""
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; subScraper-cors/1.0)",
+            "Origin": origin,
+            "Accept": "*/*",
+        })
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
+            headers = resp.headers
+    except HTTPError as exc:
+        # CORS headers are commonly present on error responses too.
+        headers = exc.headers
+    except Exception:
+        return None
+    if headers is None:
+        return None
+    return {
+        "allow_origin": (headers.get("Access-Control-Allow-Origin") or "").strip(),
+        "allow_credentials": (headers.get("Access-Control-Allow-Credentials") or "").strip().lower(),
+    }
+
+
+def check_cors_misconfiguration(url: str, host: str) -> Optional[Dict[str, Any]]:
+    """
+    Probe one live URL for a credentialed cross-origin read.
+
+    Returns the highest-severity result found, or None when the host either
+    sends no CORS headers or handles them correctly.
+    """
+    weak: Optional[Dict[str, Any]] = None
+
+    for label, origin in _cors_origin_variants(host):
+        headers = _cors_probe(url, origin)
+        if not headers:
+            continue
+        allow_origin = headers["allow_origin"]
+        credentials = headers["allow_credentials"] == "true"
+        if not allow_origin:
+            continue
+
+        reflected = allow_origin == origin or (origin == "null" and allow_origin == "null")
+        if not reflected:
+            if allow_origin == "*" and credentials and weak is None:
+                # Browsers reject this pairing, so it is a config smell rather
+                # than an exploitable bug. Record it, but never as high.
+                weak = {
+                    "host": host, "url": url, "origin": origin,
+                    "allow_origin": allow_origin, "credentials": True,
+                    "issue": "wildcard origin sent alongside allow-credentials",
+                    "exploitable": False, "severity": "LOW",
+                    "evidence": "Access-Control-Allow-Origin: * with Access-Control-Allow-Credentials: true. "
+                                "Browsers refuse this pairing, so it is a misconfiguration, not a cross-origin read.",
+                }
+            continue
+
+        if credentials:
+            # Reflected origin + credentials: an attacker page can read
+            # authenticated responses from this host.
+            return {
+                "host": host, "url": url, "origin": origin,
+                "allow_origin": allow_origin, "credentials": True,
+                "issue": label, "exploitable": True, "severity": "HIGH",
+                "evidence": (f"Sent Origin: {origin} -> Access-Control-Allow-Origin: {allow_origin} "
+                             f"with Access-Control-Allow-Credentials: true. An attacker-controlled page "
+                             f"can read authenticated responses from this host."),
+            }
+
+        if weak is None:
+            weak = {
+                "host": host, "url": url, "origin": origin,
+                "allow_origin": allow_origin, "credentials": False,
+                "issue": label, "exploitable": False, "severity": "INFO",
+                "evidence": (f"Sent Origin: {origin} -> Access-Control-Allow-Origin: {allow_origin}, "
+                             f"but credentials are not allowed, so only unauthenticated data is exposed."),
+            }
+
+    return weak
+
+
+def run_cors_scan(domain: str, config: Dict[str, Any],
+                  job_domain: Optional[str] = None) -> Dict[str, Any]:
+    """Probe every live host of a target for a credentialed cross-origin read."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    state = load_state(domain)
+    tgt = ensure_target_state(state, domain)
+    submap = tgt.get("subdomains", {})
+
+    max_hosts = int(config.get("cors_scan_max_hosts", 300) or 300)
+    candidates: List[Tuple[str, str]] = []
+    for host, entry in submap.items():
+        httpx_data = (entry or {}).get("httpx") or {}
+        url = httpx_data.get("url")
+        status = httpx_data.get("status_code")
+        if url and status:
+            candidates.append((host, url))
+    candidates.sort()
+    truncated = len(candidates) > max_hosts
+    candidates = candidates[:max_hosts]
+
+    if job_domain:
+        job_log_append(job_domain, f"CORS scan: probing {len(candidates)} live host(s).", "cors")
+
+    findings: List[Dict[str, Any]] = []
+    workers = max(1, min(10, int(config.get("cors_scan_workers", 8) or 8)))
+    if candidates:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(check_cors_misconfiguration, url, host): host
+                       for host, url in candidates}
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                except Exception:
+                    continue
+                if result:
+                    findings.append(result)
+
+    findings.sort(key=lambda f: (not f.get("exploitable"), f.get("host", "")))
+    exploitable = sum(1 for f in findings if f.get("exploitable"))
+
+    cors = {
+        "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "truncated": truncated,
+        "findings": findings,
+        "summary": {
+            "hosts_probed": len(candidates),
+            "findings": len(findings),
+            "exploitable": exploitable,
+            "informational": len(findings) - exploitable,
+        },
+    }
+
+    state = load_state(domain)
+    tgt = ensure_target_state(state, domain)
+    tgt["cors"] = cors
+    submap = tgt.get("subdomains", {})
+    by_host = {f["host"]: f for f in findings}
+    for host, entry in submap.items():
+        if not isinstance(entry, dict):
+            continue
+        finding = by_host.get(host)
+        if finding:
+            entry["cors"] = finding
+        elif "cors" in entry:
+            entry.pop("cors", None)
+    save_state(state)
+
+    if job_domain:
+        job_log_append(
+            job_domain,
+            f"CORS scan done: {exploitable} exploitable, "
+            f"{len(findings) - exploitable} informational across {len(candidates)} host(s).",
+            "cors",
+        )
+    return cors
+
+
+def summarize_cors(cors: Optional[Dict[str, Any]], max_findings: int = 5) -> Optional[Dict[str, Any]]:
+    """Compact CORS view for list payloads."""
+    if not isinstance(cors, dict):
+        return None
+    findings = cors.get("findings") or []
+    summary = cors.get("summary") or {}
+    return {
+        "scanned_at": cors.get("scanned_at"),
+        "summary": {
+            "hosts_probed": int(summary.get("hosts_probed", 0) or 0),
+            "findings": int(summary.get("findings", len(findings)) or 0),
+            "exploitable": int(summary.get("exploitable", 0) or 0),
+            "informational": int(summary.get("informational", 0) or 0),
+        },
+        "top_findings": [
+            {"host": f.get("host"), "issue": f.get("issue"),
+             "exploitable": bool(f.get("exploitable")), "severity": f.get("severity")}
+            for f in findings[:max_findings] if isinstance(f, dict)
+        ],
+    }
+
+
 def run_downstream_pipeline(
     domain: str,
     wordlist: Optional[str],
@@ -6237,7 +6862,7 @@ def run_downstream_pipeline(
 
     def wait_for_subdomains() -> List[str]:
         while True:
-            state = load_state()
+            state = load_state(domain)
             tgt = ensure_target_state(state, domain)
             subs = sorted(tgt["subdomains"].keys())
             if subs or enumerators_done_event.is_set():
@@ -6248,7 +6873,7 @@ def run_downstream_pipeline(
     log(f"Total unique subdomains for {domain}: {len(all_subs)}")
     subs_file = write_subdomains_file(domain, all_subs)
 
-    state = load_state()
+    state = load_state(domain)
     flags = ensure_target_state(state, domain)["flags"]
     
     # ---------- dnsx (DNS verification) ----------
@@ -6289,7 +6914,7 @@ def run_downstream_pipeline(
     # ---------- httpx ----------
     httpx_processed: set = set()
     while True:
-        state = load_state()
+        state = load_state(domain)
         tgt_state = ensure_target_state(state, domain)
         flags = tgt_state["flags"]
         submap = tgt_state["subdomains"]
@@ -6338,14 +6963,14 @@ def run_downstream_pipeline(
 
     # ---------- screenshots ----------
     if not config.get("enable_screenshots", True):
-        state = load_state()
+        state = load_state(domain)
         flags = ensure_target_state(state, domain)["flags"]
         update_step("screenshots", status="skipped", message="Screenshots disabled in settings.", progress=0)
         flags["screenshots_done"] = True
         save_state(state)
     else:
         while True:
-            state = load_state()
+            state = load_state(domain)
             tgt_state = ensure_target_state(state, domain)
             flags = tgt_state["flags"]
             screenshot_targets = gather_screenshot_targets(state, domain)
@@ -6375,7 +7000,7 @@ def run_downstream_pipeline(
                 flags["screenshots_done"] = True
                 save_state(state)
                 break
-            state = load_state()
+            state = load_state(domain)
             enrich_state_with_screenshots(state, domain, screenshot_map)
             save_state(state)
             job_log_append(job_domain, f"Captured screenshots for {len(screenshot_map)} hosts.", "screenshots")
@@ -6384,7 +7009,7 @@ def run_downstream_pipeline(
     # ---------- nuclei ----------
     nuclei_processed: set = set()
     while True:
-        state = load_state()
+        state = load_state(domain)
         tgt_state = ensure_target_state(state, domain)
         flags = tgt_state["flags"]
         submap = tgt_state["subdomains"]
@@ -6423,7 +7048,7 @@ def run_downstream_pipeline(
         save_state(state)
         job_log_append(job_domain, f"nuclei processed {len(new_hosts)} hosts.", "nuclei")
 
-    state = load_state()
+    state = load_state(domain)
     flags = ensure_target_state(state, domain)["flags"]
     all_subs = sorted(ensure_target_state(state, domain)["subdomains"].keys())
 
@@ -6449,9 +7074,70 @@ def run_downstream_pipeline(
         except Exception as exc:
             log(f"JS scan failed for {domain}: {exc}")
             update_step("jsscan", status="error", message=f"JS scan failed: {exc}", progress=100)
-        state = load_state()
+        state = load_state(domain)
         flags = ensure_target_state(state, domain)["flags"]
         flags["js_scan_done"] = True
+        save_state(state)
+
+    # ---------- subdomain takeover ----------
+    # Runs after httpx because it reads the CNAME chain httpx recorded; no extra
+    # resolution pass, just an HTTP fetch of the handful of third-party CNAMEs.
+    if not config.get("enable_takeover_scan", True):
+        update_step("takeover", status="skipped", message="Takeover scan disabled in settings.", progress=0)
+        state = load_state(domain)
+        flags = ensure_target_state(state, domain)["flags"]
+        flags["takeover_done"] = True
+        save_state(state)
+    elif flags.get("takeover_done"):
+        update_step("takeover", status="skipped", message="Takeover scan already completed for this target.", progress=0)
+    else:
+        update_step("takeover", status="running", message="Checking CNAMEs for dangling delegations…", progress=40)
+        try:
+            takeover = run_takeover_scan(domain, config, job_domain=job_domain)
+            summary = takeover.get("summary", {})
+            confirmed = summary.get("confirmed", 0)
+            update_step(
+                "takeover", status="completed",
+                message=(f"Takeover: {confirmed} confirmed, "
+                         f"{summary.get('unconfirmed', 0)} unconfirmed lead(s) "
+                         f"from {summary.get('candidates', 0)} third-party CNAME(s)."),
+                progress=100,
+            )
+        except Exception as exc:
+            log(f"Takeover scan failed for {domain}: {exc}")
+            update_step("takeover", status="error", message=f"Takeover scan failed: {exc}", progress=100)
+        state = load_state(domain)
+        flags = ensure_target_state(state, domain)["flags"]
+        flags["takeover_done"] = True
+        save_state(state)
+
+    # ---------- CORS misconfiguration ----------
+    if not config.get("enable_cors_scan", True):
+        update_step("cors", status="skipped", message="CORS scan disabled in settings.", progress=0)
+        state = load_state(domain)
+        flags = ensure_target_state(state, domain)["flags"]
+        flags["cors_done"] = True
+        save_state(state)
+    elif flags.get("cors_done"):
+        update_step("cors", status="skipped", message="CORS scan already completed for this target.", progress=0)
+    else:
+        update_step("cors", status="running", message="Probing live hosts for cross-origin reads…", progress=40)
+        try:
+            cors = run_cors_scan(domain, config, job_domain=job_domain)
+            summary = cors.get("summary", {})
+            update_step(
+                "cors", status="completed",
+                message=(f"CORS: {summary.get('exploitable', 0)} exploitable, "
+                         f"{summary.get('informational', 0)} informational "
+                         f"across {summary.get('hosts_probed', 0)} host(s)."),
+                progress=100,
+            )
+        except Exception as exc:
+            log(f"CORS scan failed for {domain}: {exc}")
+            update_step("cors", status="error", message=f"CORS scan failed: {exc}", progress=100)
+        state = load_state(domain)
+        flags = ensure_target_state(state, domain)["flags"]
+        flags["cors_done"] = True
         save_state(state)
 
     # ---------- nikto ----------
@@ -6460,7 +7146,7 @@ def run_downstream_pipeline(
     else:
         nikto_processed: set = set()
         while True:
-            state = load_state()
+            state = load_state(domain)
             tgt_state = ensure_target_state(state, domain)
             flags = tgt_state["flags"]
             submap = tgt_state["subdomains"]
@@ -6600,6 +7286,7 @@ def httpx_scan(subs_file: Path, domain: str, config: Optional[Dict[str, Any]] = 
         "-tech-detect",   # Detect technologies  
         "-status-code",   # Show status codes
         "-server",        # Extract server headers
+        "-cname",         # Resolve CNAME chain (feeds subdomain-takeover checks)
         "-v",
     ]
     context = {
@@ -7246,6 +7933,13 @@ def enrich_state_with_httpx(state: Dict[str, Any], domain: str, httpx_json: Path
                 entry = submap.setdefault(host, make_subdomain_entry())
                 entry.setdefault("screenshot", None)
                 entry.setdefault("scans", {})
+                # httpx reports the CNAME chain as a list; keep it so the
+                # takeover check can run without re-resolving every host.
+                cname = obj.get("cname") or obj.get("cnames")
+                if isinstance(cname, str):
+                    cname = [cname]
+                elif not isinstance(cname, list):
+                    cname = []
                 entry["httpx"] = {
                     "url": obj.get("url"),
                     "status_code": obj.get("status_code"),
@@ -7253,6 +7947,7 @@ def enrich_state_with_httpx(state: Dict[str, Any], domain: str, httpx_json: Path
                     "title": obj.get("title"),
                     "webserver": obj.get("webserver"),
                     "tech": obj.get("tech"),
+                    "cname": [str(c).strip().lower().rstrip(".") for c in cname if c],
                 }
     except Exception as e:
         log(f"Error enriching state with httpx data: {e}")
@@ -7384,6 +8079,9 @@ def target_has_pending_work(target: Dict[str, Any], config: Optional[Dict[str, A
 
 # ================== DASHBOARD GENERATION ==================
 
+MAX_DASHBOARD_ROWS_PER_TARGET = 500
+
+
 def generate_html_dashboard(state: Optional[Dict[str, Any]] = None) -> None:
     """
     Generate a single HTML file from the global state.
@@ -7454,7 +8152,13 @@ def generate_html_dashboard(state: Optional[Dict[str, Any]] = None) -> None:
             "<th>Nikto Findings</th>"
             "</tr>"
         )
-        for idx, (sub, info) in enumerate(sorted(subs.items(), key=lambda x: x[0]), start=1):
+        # dashboard.html is a static at-a-glance file, not the live UI. Rendering
+        # every subdomain of every target produced multi-hundred-MB documents no
+        # browser could open; the web UI paginates the full set.
+        sub_items = sorted(subs.items(), key=lambda x: x[0])
+        shown = sub_items[:MAX_DASHBOARD_ROWS_PER_TARGET]
+        hidden = len(sub_items) - len(shown)
+        for idx, (sub, info) in enumerate(shown, start=1):
             sources = info.get("sources", [])
             httpx = info.get("httpx") or {}
             screenshot = info.get("screenshot") or {}
@@ -7507,6 +8211,11 @@ def generate_html_dashboard(state: Optional[Dict[str, Any]] = None) -> None:
                 "</tr>"
             )
 
+        if hidden > 0:
+            html_parts.append(
+                f"<tr><td colspan='7'>… {hidden} more subdomain(s); "
+                f"open the web UI for the full list.</td></tr>"
+            )
         html_parts.append("</table>")
 
     html_parts.append("</body></html>")
@@ -7540,7 +8249,7 @@ def run_pipeline(
                     message: Optional[str] = None, progress: Optional[int] = None) -> None:
         job_step_update(job_domain, step_name, status=status, message=message, progress=progress)
 
-    state = load_state()
+    state = load_state(domain)
     tgt = ensure_target_state(state, domain)
     flags = tgt["flags"]
     options = tgt.setdefault("options", {})
@@ -7564,7 +8273,7 @@ def run_pipeline(
     def start_downstream_if_ready() -> None:
         if downstream_started.is_set():
             return
-        current_state = load_state()
+        current_state = load_state(domain)
         sub_count = len(ensure_target_state(current_state, domain)["subdomains"])
         if sub_count == 0 and not enumerators_done_event.is_set():
             return
@@ -7715,7 +8424,7 @@ def run_pipeline(
                 if subs is None:
                     update_step(step_name, status="error", message=f"{desc} failed: {enum_errors.get(step_name, 'Unknown error')}", progress=100)
                     continue
-                current_state = load_state()
+                current_state = load_state(domain)
                 add_subdomains_to_state(current_state, domain, subs, step_name)
                 ensure_target_state(current_state, domain)["flags"][flag_key] = True
                 save_state(current_state)
@@ -7787,7 +8496,7 @@ def _start_job_thread(job: Dict[str, Any]) -> None:
             schedule_jobs()
             cleanup_job_control(domain)
             # Update on-disk active-job snapshot (this job is now finished).
-            persist_active_jobs()
+            request_active_jobs_persist()
 
     thread = threading.Thread(target=runner, name=f"pipeline-{domain}", daemon=True)
     with JOB_LOCK:
@@ -7837,6 +8546,10 @@ def schedule_jobs() -> None:
 
 # Statuses that represent unfinished work worth restoring after a restart.
 _ACTIVE_JOB_STATUSES = {"queued", "running", "dispatching", "paused", "pausing"}
+
+
+ACTIVE_JOBS_PERSIST_LOCK = threading.Lock()
+_ACTIVE_JOBS_DIRTY = False
 
 
 def persist_active_jobs() -> None:
@@ -7892,12 +8605,30 @@ def restore_active_jobs() -> int:
     return restored
 
 
+def request_active_jobs_persist() -> None:
+    """
+    Mark the active-jobs snapshot stale instead of rewriting it now.
+
+    The snapshot is a single whole-file write. Doing it inline on every enqueue
+    made bulk imports quadratic: dispatching N targets rewrote a file that grew
+    with N, N times over.
+    """
+    global _ACTIVE_JOBS_DIRTY
+    with ACTIVE_JOBS_PERSIST_LOCK:
+        _ACTIVE_JOBS_DIRTY = True
+
+
 def active_jobs_persist_loop() -> None:
     """Periodically persist active jobs so a crash/restart loses at most ~10s."""
+    global _ACTIVE_JOBS_DIRTY
     while True:
         try:
             time.sleep(10)
-            persist_active_jobs()
+            with ACTIVE_JOBS_PERSIST_LOCK:
+                dirty = _ACTIVE_JOBS_DIRTY
+                _ACTIVE_JOBS_DIRTY = False
+            if dirty:
+                persist_active_jobs()
         except Exception:
             # Never let the persister thread die.
             try:
@@ -7983,27 +8714,66 @@ def job_record_has_errors(job: Dict[str, Any]) -> bool:
     return any(entry.get("status") == "error" for entry in job.get("steps", {}).values())
 
 
-def append_domain_history(domain: str, entry: Dict[str, Any]) -> None:
-    """Append an entry to domain history in SQLite database."""
-    if not domain or not entry:
-        return
+# Tools emit log lines in bursts, and a commit per line means an fsync per line
+# on a database every job thread shares. Buffer instead and flush on a short
+# timer, on a full buffer, or on demand before anything reads history back.
+HISTORY_BUFFER_LOCK = threading.Lock()
+HISTORY_BUFFER: List[Tuple[str, str, str, str, str]] = []
+HISTORY_BUFFER_MAX = 200
+HISTORY_FLUSH_INTERVAL = 2.0
+_HISTORY_THREAD: Optional[threading.Thread] = None
+
+
+def flush_domain_history() -> None:
+    """Write any buffered history rows to the database."""
+    with HISTORY_BUFFER_LOCK:
+        if not HISTORY_BUFFER:
+            return
+        rows = HISTORY_BUFFER[:]
+        HISTORY_BUFFER.clear()
     try:
         db = get_db()
-        cursor = db.cursor()
-        now = datetime.now(timezone.utc).isoformat()
-        
-        timestamp = entry.get("ts", now)
-        source = entry.get("source", "system")
-        text = entry.get("text", "")
-        
-        cursor.execute(
-            """INSERT INTO history (domain, timestamp, source, text, created_at) 
+        db.cursor().executemany(
+            """INSERT INTO history (domain, timestamp, source, text, created_at)
                VALUES (?, ?, ?, ?, ?)""",
-            (domain, timestamp, source, text, now)
+            rows,
         )
         db.commit()
     except Exception as exc:
-        log(f"Failed to write history for {domain}: {exc}")
+        log(f"Failed to write history rows: {exc}")
+
+
+def _history_flush_loop() -> None:
+    while True:
+        time.sleep(HISTORY_FLUSH_INTERVAL)
+        try:
+            flush_domain_history()
+        except Exception:
+            pass
+
+
+def append_domain_history(domain: str, entry: Dict[str, Any]) -> None:
+    """Queue an entry for the domain history table."""
+    global _HISTORY_THREAD
+    if not domain or not entry:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    row = (
+        domain,
+        entry.get("ts", now),
+        entry.get("source", "system"),
+        entry.get("text", ""),
+        now,
+    )
+    with HISTORY_BUFFER_LOCK:
+        HISTORY_BUFFER.append(row)
+        full = len(HISTORY_BUFFER) >= HISTORY_BUFFER_MAX
+        if _HISTORY_THREAD is None or not _HISTORY_THREAD.is_alive():
+            _HISTORY_THREAD = threading.Thread(
+                target=_history_flush_loop, name="history-flush", daemon=True)
+            _HISTORY_THREAD.start()
+    if full:
+        flush_domain_history()
 
 
 def load_domain_history(domain: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -8024,6 +8794,8 @@ def load_domain_history(domain: str, limit: Optional[int] = None) -> List[Dict[s
         that within the same timestamp, newer entries (higher id) come first
         in the DESC sort, maintaining insertion order.
     """
+    # Recent lines may still be sitting in the write buffer.
+    flush_domain_history()
     db = get_db()
     cursor = db.cursor()
     
@@ -8490,6 +9262,16 @@ button:hover { background:#1d4ed8; }
           <div id="overview-js-findings"></div>
         </div>
         <div class="card" style="margin: 24px 0;">
+          <h3>Subdomain Takeover</h3>
+          <p class="muted">Hosts whose CNAME still points at a third-party service that no longer claims them. Confirmed entries returned the provider's unclaimed-resource page.</p>
+          <div id="overview-takeover-findings"></div>
+        </div>
+        <div class="card" style="margin: 24px 0;">
+          <h3>CORS Misconfiguration</h3>
+          <p class="muted">Hosts that reflect an attacker-supplied Origin. Exploitable entries also allow credentials, so a third-party page can read authenticated responses.</p>
+          <div id="overview-cors-findings"></div>
+        </div>
+        <div class="card" style="margin: 24px 0;">
           <h3>Recent Targets</h3>
           <p class="muted">Quick overview of all tracked domains</p>
           <div id="overview-targets-list"></div>
@@ -8841,6 +9623,14 @@ button:hover { background:#1d4ed8; }
               <label class="checkbox">
                 <input id="settings-enable-js-scan" type="checkbox" name="enable_js_scan" />
                 Enable JS Scan (secrets, endpoints, params)
+              </label>
+              <label class="checkbox">
+                <input id="settings-enable-takeover-scan" type="checkbox" name="enable_takeover_scan" />
+                Enable subdomain takeover check (dangling CNAMEs)
+              </label>
+              <label class="checkbox">
+                <input id="settings-enable-cors-scan" type="checkbox" name="enable_cors_scan" />
+                Enable CORS misconfiguration check
               </label>
               <label class="checkbox">
                 <input id="settings-bundled-nuclei-templates" type="checkbox" name="use_bundled_nuclei_templates" />
@@ -9576,6 +10366,7 @@ const historyCache = {};
 const commandHistoryCache = {};
 let selectedReportDomain = null;
 let latestRunningJobs = [];
+let latestQueuedTotal = 0;
 let latestQueuedJobs = [];
 const settingsForm = document.getElementById('settings-form');
 const settingsWordlist = document.getElementById('settings-wordlist');
@@ -9595,6 +10386,8 @@ const settingsEnableDnsx = document.getElementById('settings-enable-dnsx');
 const settingsEnableWaybackurls = document.getElementById('settings-enable-waybackurls');
 const settingsEnableGau = document.getElementById('settings-enable-gau');
 const settingsEnableJsScan = document.getElementById('settings-enable-js-scan');
+const settingsEnableTakeoverScan = document.getElementById('settings-enable-takeover-scan');
+const settingsEnableCorsScan = document.getElementById('settings-enable-cors-scan');
 const settingsBundledNucleiTemplates = document.getElementById('settings-bundled-nuclei-templates');
 const settingsSubfinderThreads = document.getElementById('settings-subfinder-threads');
 const settingsAssetfinderThreads = document.getElementById('settings-assetfinder-threads');
@@ -9700,6 +10493,8 @@ const STEP_SEQUENCE = [
   { flag: 'screenshots_done', label: 'Screenshots', skipWhen: () => latestConfig.enable_screenshots === false },
   { flag: 'nuclei_done', label: 'Nuclei' },
   { flag: 'js_scan_done', label: 'JS Scan', skipWhen: () => latestConfig.enable_js_scan === false },
+  { flag: 'takeover_done', label: 'Takeover', skipWhen: () => latestConfig.enable_takeover_scan === false },
+  { flag: 'cors_done', label: 'CORS', skipWhen: () => latestConfig.enable_cors_scan === false },
   { flag: 'nikto_done', label: 'Nikto', skipWhen: (info) => shouldSkipNikto(info) },
 ];
 const DEFAULT_PAGE_SIZE = 50;
@@ -10281,9 +11076,11 @@ let queuePaginationState = {
   totalPages: 1
 };
 
-function renderQueue(queue) {
+function renderQueue(queue, totalQueued) {
   const items = Array.isArray(queue) ? queue : [];
-  statQueued.textContent = items.length;
+  // The server caps how many queue entries it ships; totalQueued is the real depth.
+  const total = Number.isFinite(totalQueued) ? totalQueued : items.length;
+  statQueued.textContent = total > items.length ? `${total} (showing ${items.length})` : total;
   if (!items.length) {
     queueList.innerHTML = '<div class="section-placeholder">Queue empty.</div>';
     const pagerEl = document.getElementById('queue-pagination');
@@ -10369,10 +11166,123 @@ document.addEventListener('click', (event) => {
   }
   
   // Re-render queue with new page - latestQueuedJobs is already from API
-  renderQueue(latestQueuedJobs);
+  renderQueue(latestQueuedJobs, latestQueuedTotal);
 });
 
 // ---- Overview: JS findings ------------------------------------------------
+function renderCorsOverview(targets) {
+  const container = document.getElementById('overview-cors-findings');
+  if (!container) return;
+  let scanned = 0, probed = 0, exploitable = 0, informational = 0;
+  const rows = [];
+
+  Object.entries(targets || {}).forEach(([domain, info]) => {
+    const c = info && info.cors;
+    if (!c) return;
+    const sm = c.summary || {};
+    scanned += 1;
+    probed += Number(sm.hosts_probed || 0);
+    exploitable += Number(sm.exploitable || 0);
+    informational += Number(sm.informational || 0);
+    (c.top_findings || []).forEach(f => {
+      if (f) rows.push({ domain, host: f.host || '', issue: f.issue || '',
+                         exploitable: !!f.exploitable, severity: f.severity || '' });
+    });
+  });
+
+  if (!scanned) {
+    container.innerHTML = '<div class="section-placeholder">No CORS results yet. The check runs after httpx against live hosts - enable it under Settings if it is off.</div>';
+    return;
+  }
+  if (!rows.length) {
+    container.innerHTML = `<p class="muted" style="margin-top:0;">${scanned} target(s) checked &middot; ${probed} host(s) probed &middot; <strong>no origin reflection found</strong>.</p>`;
+    return;
+  }
+
+  rows.sort((a, b) => (b.exploitable - a.exploitable) || a.domain.localeCompare(b.domain));
+
+  container.innerHTML = `
+    <p class="muted" style="margin-top:0;">
+      ${scanned} target(s) checked &middot; ${probed} host(s) probed &middot;
+      <strong>${exploitable}</strong> exploitable &middot; ${informational} informational
+    </p>
+    <div class="table-wrapper">
+      <table class="targets-table">
+        <thead><tr><th>Host</th><th>Domain</th><th>Weakness</th><th>Status</th></tr></thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td>${escapeHtml(r.host)}</td>
+              <td>${escapeHtml(r.domain)}</td>
+              <td>${escapeHtml(r.issue)}</td>
+              <td>${r.exploitable
+                    ? '<span class="tag sev-high">credentialed read</span>'
+                    : `<span class="badge">${escapeHtml(r.severity || 'info')}</span>`}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderTakeoverOverview(targets) {
+  const container = document.getElementById('overview-takeover-findings');
+  if (!container) return;
+  const entries = Object.entries(targets || {});
+
+  let scanned = 0, candidates = 0, confirmed = 0, unconfirmed = 0;
+  const rows = [];
+
+  entries.forEach(([domain, info]) => {
+    const t = info && info.takeover;
+    if (!t) return;
+    const c = t.summary || {};
+    scanned += 1;
+    candidates += Number(c.candidates || 0);
+    confirmed += Number(c.confirmed || 0);
+    unconfirmed += Number(c.unconfirmed || 0);
+    (t.top_findings || []).forEach(f => {
+      if (f) rows.push({ domain, host: f.host || '', service: f.service || '', confirmed: !!f.confirmed });
+    });
+  });
+
+  if (!scanned) {
+    container.innerHTML = '<div class="section-placeholder">No takeover results yet. The check runs after httpx, using the CNAMEs it recorded - enable it under Settings if it is off.</div>';
+    return;
+  }
+
+  if (!rows.length) {
+    container.innerHTML = `<p class="muted" style="margin-top:0;">${scanned} target(s) checked &middot; ${candidates} third-party CNAME(s) &middot; <strong>no dangling delegations found</strong>.</p>`;
+    return;
+  }
+
+  // Confirmed first: those are the ones worth acting on.
+  rows.sort((a, b) => (b.confirmed - a.confirmed) || a.domain.localeCompare(b.domain));
+
+  container.innerHTML = `
+    <p class="muted" style="margin-top:0;">
+      ${scanned} target(s) checked &middot; ${candidates} third-party CNAME(s) &middot;
+      <strong>${confirmed}</strong> confirmed &middot; ${unconfirmed} unconfirmed lead(s)
+    </p>
+    <div class="table-wrapper">
+      <table class="targets-table">
+        <thead><tr><th>Host</th><th>Domain</th><th>Service</th><th>Status</th></tr></thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td>${escapeHtml(r.host)}</td>
+              <td>${escapeHtml(r.domain)}</td>
+              <td>${escapeHtml(r.service)}</td>
+              <td>${r.confirmed
+                    ? '<span class="tag sev-high">confirmed</span>'
+                    : '<span class="badge">verify by hand</span>'}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 function renderJsFindingsOverview(targets) {
   const container = document.getElementById('overview-js-findings');
   const statSecrets = document.getElementById('stat-js-secrets');
@@ -11223,7 +12133,31 @@ function renderWorkflowDiagram() {
     </div>
     
     <div class="workflow-stage">
-      <div class="workflow-stage-title">Phase 6: Web Server Scanning</div>
+      <div class="workflow-stage-title">Phase 6: Subdomain Takeover</div>
+      <div class="workflow-tools">
+        <span class="workflow-tool scanning">Takeover Check</span>
+      </div>
+      <div class="workflow-description">Reuses the CNAME chain HTTPX recorded to spot hosts still delegated to a third-party service that no longer claims them, then fetches each one and only reports a takeover when the provider's unclaimed-resource fingerprint is actually in the response.</div>
+    </div>
+
+    <div style="text-align:center; margin:16px 0;">
+      <span class="workflow-arrow">↓</span>
+    </div>
+
+    <div class="workflow-stage">
+      <div class="workflow-stage-title">Phase 7: CORS Misconfiguration</div>
+      <div class="workflow-tools">
+        <span class="workflow-tool scanning">CORS Check</span>
+      </div>
+      <div class="workflow-description">Replays each live host with attacker-controlled Origin values to find allowlists that are reflected rather than checked. Only flagged as exploitable when the reflected origin comes back alongside Access-Control-Allow-Credentials: true, since that is the pairing a browser will actually honour.</div>
+    </div>
+
+    <div style="text-align:center; margin:16px 0;">
+      <span class="workflow-arrow">↓</span>
+    </div>
+
+    <div class="workflow-stage">
+      <div class="workflow-stage-title">Phase 8: Web Server Scanning</div>
       <div class="workflow-tools">
         <span class="workflow-tool scanning">Nikto</span>
       </div>
@@ -12060,6 +12994,8 @@ function attachOverviewFilterListeners() {
     saveOverviewFiltersToStorage();
     renderOverviewTargets(latestTargetsData);
     renderJsFindingsOverview(latestTargetsData);
+    renderTakeoverOverview(latestTargetsData);
+    renderCorsOverview(latestTargetsData);
   };
   
   if (domainSearch) {
@@ -13387,6 +14323,8 @@ function renderSettings(config, tools) {
     settingsEnableWaybackurls.checked = config.enable_waybackurls !== false;
     settingsEnableGau.checked = config.enable_gau !== false;
     if (settingsEnableJsScan) settingsEnableJsScan.checked = config.enable_js_scan !== false;
+    if (settingsEnableTakeoverScan) settingsEnableTakeoverScan.checked = config.enable_takeover_scan !== false;
+    if (settingsEnableCorsScan) settingsEnableCorsScan.checked = config.enable_cors_scan !== false;
     if (settingsBundledNucleiTemplates) settingsBundledNucleiTemplates.checked = config.use_bundled_nuclei_templates !== false;
     settingsSubfinderThreads.value = config.subfinder_threads || 32;
     settingsAssetfinderThreads.value = config.assetfinder_threads || 10;
@@ -13466,12 +14404,15 @@ async function fetchState() {
     latestConfig = data.config || {};
     latestRunningJobs = data.running_jobs || [];
     latestQueuedJobs = data.queued_jobs || [];
+    latestQueuedTotal = Number.isFinite(data.queued_total) ? data.queued_total : latestQueuedJobs.length;
     latestTargetsData = data.targets || {};
     document.getElementById('last-updated').textContent = 'Last updated: ' + (data.last_updated || 'never');
     renderJobs(data.running_jobs || []);
-    renderQueue(data.queued_jobs || []);
+    renderQueue(data.queued_jobs || [], data.queued_total);
     renderOverviewTargets(data.targets || {});
     renderJsFindingsOverview(data.targets || {});
+    renderTakeoverOverview(data.targets || {});
+    renderCorsOverview(data.targets || {});
     renderTargets(data.targets || {});
     renderSettings(data.config || {}, data.tools || {});
     renderWorkers(data.workers || {});
@@ -13628,6 +14569,8 @@ if (settingsForm) {
         enable_waybackurls: settingsEnableWaybackurls ? settingsEnableWaybackurls.checked : true,
         enable_gau: settingsEnableGau ? settingsEnableGau.checked : true,
         enable_js_scan: settingsEnableJsScan ? settingsEnableJsScan.checked : true,
+        enable_takeover_scan: settingsEnableTakeoverScan ? settingsEnableTakeoverScan.checked : true,
+        enable_cors_scan: settingsEnableCorsScan ? settingsEnableCorsScan.checked : true,
         use_bundled_nuclei_templates: settingsBundledNucleiTemplates ? settingsBundledNucleiTemplates.checked : true,
         subfinder_threads: settingsSubfinderThreads ? settingsSubfinderThreads.value : '',
         assetfinder_threads: settingsAssetfinderThreads ? settingsAssetfinderThreads.value : '',
@@ -14619,57 +15562,90 @@ window.addEventListener('hashchange', () => {
 """
 
 
-def snapshot_running_jobs() -> List[Dict[str, Any]]:
+# The dashboard polls job state every few seconds. Queued jobs share one
+# identical "all steps pending" skeleton and have no logs yet, so shipping a
+# per-job copy of both to the browser costs ~6KB each and buys nothing: the UI
+# filters queued jobs out of the job list and renders them from the separate
+# queue snapshot instead. With a large backlog that copy alone was ~100MB of
+# JSON per poll, built while holding JOB_LOCK, which stalled every job thread.
+MAX_JOBS_IN_SNAPSHOT = 50
+MAX_QUEUE_IN_SNAPSHOT = 200
+MAX_LOGS_IN_SNAPSHOT = 120
+
+
+def snapshot_running_jobs(include_logs: bool = True,
+                          limit: int = MAX_JOBS_IN_SNAPSHOT) -> List[Dict[str, Any]]:
+    """
+    Snapshot non-queued jobs for the dashboard.
+
+    Queued jobs are excluded: job_queue_snapshot() covers them with the handful
+    of fields the queue view needs. Logs are tail-capped so a long-running job
+    cannot grow the payload without bound.
+    """
+    def entry(domain: Optional[str], job: Dict[str, Any], *,
+              default_status: str, default_progress: int,
+              completed_at: Optional[str], thread_alive: bool) -> Dict[str, Any]:
+        steps = {name: dict(data) for name, data in (job.get("steps") or {}).items()}
+        if include_logs:
+            logs = [dict(item) for item in (job.get("logs") or [])[-MAX_LOGS_IN_SNAPSHOT:]]
+        else:
+            logs = []
+        return {
+            "domain": domain,
+            "started": job.get("started"),
+            "queued_at": job.get("queued_at"),
+            "wordlist": job.get("wordlist") or "",
+            "skip_nikto": job.get("skip_nikto", False),
+            "interval": job.get("interval", DEFAULT_INTERVAL),
+            "status": job.get("status", default_status),
+            "message": job.get("message", ""),
+            "progress": job.get("progress", default_progress),
+            "last_update": job.get("last_update"),
+            "thread_alive": thread_alive,
+            "steps": steps,
+            "logs": logs,
+            "completed_at": completed_at,
+        }
+
     with JOB_LOCK:
-        results = []
-        
-        # Add running jobs
+        active: List[Dict[str, Any]] = []
         for domain, job in RUNNING_JOBS.items():
-            steps = {name: dict(data) for name, data in (job.get("steps") or {}).items()}
-            thread_alive = bool(job.get("thread") and job["thread"].is_alive())
-            logs = [dict(entry) for entry in job.get("logs", [])]
-            results.append({
-                "domain": domain,
-                "started": job.get("started"),
-                "queued_at": job.get("queued_at"),
-                "wordlist": job.get("wordlist") or "",
-                "skip_nikto": job.get("skip_nikto", False),
-                "interval": job.get("interval", DEFAULT_INTERVAL),
-                "status": job.get("status", "running"),
-                "message": job.get("message", ""),
-                "progress": job.get("progress", 0),
-                "last_update": job.get("last_update"),
-                "thread_alive": thread_alive,
-                "steps": steps,
-                "logs": logs,
-                "completed_at": None,
-            })
-        
-        # Add completed jobs
-        for job_key, job in COMPLETED_JOBS.items():
-            steps = {name: dict(data) for name, data in (job.get("steps") or {}).items()}
-            logs = [dict(entry) for entry in job.get("logs", [])]
-            results.append({
-                "domain": job.get("domain"),
-                "started": job.get("started"),
-                "queued_at": job.get("queued_at"),
-                "wordlist": job.get("wordlist") or "",
-                "skip_nikto": job.get("skip_nikto", False),
-                "interval": job.get("interval", DEFAULT_INTERVAL),
-                "status": job.get("status", "completed"),
-                "message": job.get("message", ""),
-                "progress": job.get("progress", 100),
-                "last_update": job.get("last_update"),
-                "thread_alive": False,
-                "steps": steps,
-                "logs": logs,
-                "completed_at": job.get("completed_at"),
-            })
-        
-        return results
+            if job.get("status") == "queued":
+                continue
+            thread = job.get("thread")
+            active.append(entry(
+                domain, job,
+                default_status="running", default_progress=0,
+                completed_at=None,
+                thread_alive=bool(thread and thread.is_alive()),
+            ))
+
+        # Newest completions first, so the cap drops stale reports rather than
+        # the one the user just finished watching.
+        completed_items = sorted(
+            COMPLETED_JOBS.values(),
+            key=lambda job: str(job.get("completed_at") or ""),
+            reverse=True,
+        )
+        budget = max(0, limit - len(active))
+        done = [
+            entry(job.get("domain"), job,
+                  default_status="completed", default_progress=100,
+                  completed_at=job.get("completed_at"), thread_alive=False)
+            for job in completed_items[:budget]
+        ]
+
+    return active[:limit] + done
 
 
-def job_queue_snapshot() -> List[Dict[str, Any]]:
+def count_queued_jobs() -> int:
+    with JOB_LOCK:
+        return sum(1 for job in RUNNING_JOBS.values() if job.get("status") == "queued")
+
+
+def job_queue_snapshot(limit: int = MAX_QUEUE_IN_SNAPSHOT) -> List[Dict[str, Any]]:
+    """Front of the queue only; the UI shows a page at a time and gets the true
+    depth from the payload's queued_total."""
     with JOB_LOCK:
         snapshot = []
         for position, domain in enumerate(JOB_QUEUE, start=1):
@@ -14684,6 +15660,8 @@ def job_queue_snapshot() -> List[Dict[str, Any]]:
                 "skip_nikto": job.get("skip_nikto", False),
                 "interval": job.get("interval", DEFAULT_INTERVAL),
             })
+            if len(snapshot) >= limit:
+                break
         return snapshot
 
 
@@ -14962,7 +15940,7 @@ def skip_job_step(domain: str, step: str) -> Tuple[bool, str]:
             return False, f"No active job for {normalized}."
     
     # Load state and mark step as done
-    state = load_state()
+    state = load_state(normalized)
     target = state.get("targets", {}).get(normalized)
     
     if not target:
@@ -15070,7 +16048,7 @@ def resume_target_scan(domain: str, wordlist: Optional[str] = None,
     if not normalized:
         return False, "Domain is required."
     cfg = get_config()
-    state = load_state()
+    state = load_state(normalized)
     target = state.get("targets", {}).get(normalized)
     if not target:
         return False, f"No stored reconnaissance data for {normalized}."
@@ -15288,6 +16266,15 @@ def start_pipeline_job(domain: str, wordlist: Optional[str], skip_nikto: bool, i
             "last_update": now,
             "logs": [],
         }
+        if count_active_jobs_locked() >= MAX_RUNNING_JOBS and len(JOB_QUEUE) >= MAX_QUEUED_JOBS:
+            # Each queued job pins a full step tree in memory and in every
+            # snapshot. An unbounded queue (a wildcard/TLD expansion can produce
+            # tens of thousands of targets) exhausts memory long before the
+            # backlog drains, so refuse rather than accept work that cannot run.
+            return False, (
+                f"Queue is full ({MAX_QUEUED_JOBS} waiting). "
+                f"{normalized} was not queued — let the backlog drain first."
+            )
         RUNNING_JOBS[normalized] = job_record
         ensure_job_control(normalized)
         if count_active_jobs_locked() < MAX_RUNNING_JOBS:
@@ -15298,11 +16285,11 @@ def start_pipeline_job(domain: str, wordlist: Optional[str], skip_nikto: bool, i
 
     if start_now:
         _start_job_thread(job_record)
-        persist_active_jobs()
+        request_active_jobs_persist()
         return True, f"Recon started for {normalized}."
 
     job_log_append(normalized, "Queued for execution.", "scheduler")
-    persist_active_jobs()
+    request_active_jobs_persist()
     return True, f"{normalized} queued; it will start when a worker is free."
 
 
@@ -15389,6 +16376,8 @@ def build_state_payload_summary() -> Dict[str, Any]:
                 "comments": target_comments,
                 "endpoint_count": len(extra.get("endpoints", []) or []),
                 "js_scan": summarize_js_scan(extra.get("js_scan")),
+                "takeover": summarize_takeover(extra.get("takeover")),
+                "cors": summarize_cors(extra.get("cors")),
             }
             subdomains = {}
             subdomain_count = 0
@@ -15501,6 +16490,8 @@ def build_state_payload_summary() -> Dict[str, Any]:
                 "from_completed_jobs": True,
                 "endpoint_count": len(state_data.get("endpoints", []) or []),
                 "js_scan": summarize_js_scan(state_data.get("js_scan")),
+                "takeover": summarize_takeover(state_data.get("takeover")),
+                "cors": summarize_cors(state_data.get("cors")),
             }
     
     # Get last updated time
@@ -15521,6 +16512,7 @@ def build_state_payload_summary() -> Dict[str, Any]:
         "targets": targets,
         "running_jobs": snapshot_running_jobs(),
         "queued_jobs": job_queue_snapshot(),
+        "queued_total": count_queued_jobs(),
         "config": config,
         "tools": tool_info,
         "workers": snapshot_workers(),
@@ -15587,6 +16579,7 @@ def build_state_payload() -> Dict[str, Any]:
         "targets": all_targets,
         "running_jobs": snapshot_running_jobs(),
         "queued_jobs": job_queue_snapshot(),
+        "queued_total": count_queued_jobs(),
         "config": config,
         "tools": tool_info,
         "workers": snapshot_workers(),
@@ -15774,6 +16767,7 @@ def build_state_payload_paginated(page: int = 1, per_page: int = 50, full: bool 
         "targets": targets,
         "running_jobs": snapshot_running_jobs(),
         "queued_jobs": job_queue_snapshot(),
+        "queued_total": count_queued_jobs(),
         "config": config,
         "tools": tool_info,
         "workers": snapshot_workers(),
@@ -18985,6 +19979,14 @@ form.addEventListener('submit', async (e) => {
             self._send_json({"success": True,
                              **js_findings_overview(limit_targets=limit, limit_secrets=limit)})
             return
+        if self.path.startswith("/api/takeover-findings"):
+            params = parse_qs(urlparse(self.path).query)
+            try:
+                limit = max(1, min(200, int(params.get("limit", ["25"])[0])))
+            except (TypeError, ValueError):
+                limit = 25
+            self._send_json({"success": True, **takeover_findings_overview(limit=limit)})
+            return
         if self.path == "/api/dynamic-mode":
             self._send_json(get_dynamic_mode_status())
             return
@@ -19157,7 +20159,7 @@ form.addEventListener('submit', async (e) => {
             self._send_json({"domain": domain, "events": events})
             return
         if self.path == "/api/export/state":
-            data = json.dumps(load_state(), indent=2).encode("utf-8")
+            data = json.dumps(public_state(load_state()), indent=2).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -20075,6 +21077,9 @@ def run_server(host: str, port: int, interval: int, use_https: bool = False, cer
         log("Web server interrupted by user.")
     finally:
         server.server_close()
+        # Don't lose log lines or a queue snapshot still pending a debounced write.
+        flush_domain_history()
+        persist_active_jobs()
 
 # ================== CLI ==================
 
